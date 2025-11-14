@@ -123,25 +123,116 @@ connect_to_arduino()
 # --- 카메라 초기화 ---
 camera = None
 camera_status = False
-try:
-    camera = cv2.VideoCapture(0)
-    if camera.isOpened():
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        camera_status = True
-        print("✅ Camera initialized.")
-    else:
-        print("⚠️ Camera not available - continuing without camera")
+camera_device = None
+
+def find_working_camera():
+    """사용 가능한 카메라 장치를 찾습니다."""
+    import os
+    
+    # 가능한 카메라 장치들 (우선순위 순)
+    camera_candidates = [
+        # 일반적인 카메라 인덱스
+        0, 1, 2, 3, 4,
+        # Raspberry Pi 카메라 모듈
+        '/dev/video0', '/dev/video1', '/dev/video2', '/dev/video3',
+        # USB 카메라 (일반적으로 높은 번호)
+        '/dev/video10', '/dev/video11', '/dev/video12', '/dev/video13',
+        '/dev/video14', '/dev/video15', '/dev/video16', '/dev/video17',
+        '/dev/video18', '/dev/video19', '/dev/video20', '/dev/video21',
+        '/dev/video22', '/dev/video23', '/dev/video24', '/dev/video25',
+        '/dev/video26', '/dev/video27', '/dev/video28', '/dev/video29',
+        '/dev/video30', '/dev/video31'
+    ]
+    
+    print("🔍 Searching for working camera...")
+    
+    for device in camera_candidates:
+        try:
+            print(f"  Testing camera: {device}")
+            
+            # V4L2 백엔드로 시도
+            if isinstance(device, str) and device.startswith('/dev/video'):
+                test_camera = cv2.VideoCapture(device, cv2.CAP_V4L2)
+            else:
+                test_camera = cv2.VideoCapture(device)
+            
+            if test_camera.isOpened():
+                # 실제로 프레임을 읽을 수 있는지 테스트
+                ret, frame = test_camera.read()
+                if ret and frame is not None and frame.size > 0:
+                    print(f"✅ Working camera found: {device}")
+                    test_camera.release()
+                    return device
+                else:
+                    print(f"  Camera {device}: Opened but no valid frame")
+            else:
+                print(f"  Camera {device}: Cannot open")
+            
+            test_camera.release()
+            
+        except Exception as e:
+            print(f"  Camera {device}: Error - {e}")
+            continue
+    
+    print("❌ No working camera found")
+    return None
+
+def initialize_camera():
+    """카메라를 초기화합니다."""
+    global camera, camera_status, camera_device
+    
+    camera_device = find_working_camera()
+    
+    if camera_device is None:
+        print("⚠️ No camera available - continuing without camera")
         camera_status = False
-except Exception as e:
-    print(f"⚠️ Camera initialization failed: {e} - continuing without camera")
-    camera_status = False
+        return False
+    
+    try:
+        # V4L2 백엔드 사용
+        if isinstance(camera_device, str) and camera_device.startswith('/dev/video'):
+            camera = cv2.VideoCapture(camera_device, cv2.CAP_V4L2)
+        else:
+            camera = cv2.VideoCapture(camera_device)
+            
+        if camera.isOpened():
+            # 카메라 설정
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            camera.set(cv2.CAP_PROP_FPS, 30)
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 버퍼 크기 최소화
+            
+            # 실제 프레임 읽기 테스트
+            ret, frame = camera.read()
+            if ret and frame is not None and frame.size > 0:
+                camera_status = True
+                print(f"✅ Camera initialized successfully: {camera_device}")
+                print(f"   Frame size: {frame.shape}")
+                return True
+            else:
+                print(f"⚠️ Camera opened but cannot read frames: {camera_device}")
+                camera.release()
+                camera = None
+                camera_status = False
+                return False
+        else:
+            print(f"⚠️ Failed to open camera: {camera_device}")
+            camera_status = False
+            return False
+            
+    except Exception as e:
+        print(f"⚠️ Camera initialization failed: {e}")
+        camera_status = False
+        return False
+
+# 카메라 초기화 실행
+initialize_camera()
 
 # --- 백그라운드 스레드 (아두이노 데이터 수신) ---
 def arduino_reader_thread():
     last_heartbeat = time.time()
     heartbeat_timeout = 10
-    # sensor_update 송신 스로틀(최대 60Hz)
+    # sensor_update 송신 스로틀(실시간, 60Hz)
     last_emit = 0.0
     emit_interval = 1.0 / 60.0
 
@@ -153,13 +244,16 @@ def arduino_reader_thread():
                         line = ser.readline().decode('utf-8', 'ignore').strip()
                         if line:
                             last_heartbeat = time.time()
-                            socketio.emit('serial_log', {'data': f'[RECV] {line}'})
+                            # 센서 데이터는 실시간으로 전송, 로그만 5초마다
                             if line.startswith('{') and line.endswith('}'):
                                 now = time.time()
                                 if now - last_emit >= emit_interval:
                                     sensor_data = json.loads(line)
                                     socketio.emit('sensor_update', sensor_data)
                                     last_emit = now
+                            else:
+                                # JSON이 아닌 메시지만 로그 출력
+                                socketio.emit('serial_log', {'data': f'[RECV] {line}'})
                     except Exception as e:
                         socketio.emit('serial_log', {'data': f"[ERROR] {e}"})
                         if "device not found" in str(e).lower() or "permission denied" in str(e).lower():
@@ -228,6 +322,7 @@ def handle_connect():
         'arduino_connected': ser is not None and ser.is_open,
         'camera_connected': camera_status,
         'arduino_port': SERIAL_PORT if ser and ser.is_open else 'Not connected',
+        'camera_device': camera_device if camera_status else 'Not available',
         'camera_status': 'Connected' if camera_status else 'Not available',
         'retry_count': connection_retry_count,
         'max_retry_count': MAX_RETRY_COUNT
@@ -243,10 +338,19 @@ def handle_reconnect_request():
     print('🔄 Manual reconnection requested by client')
     global connection_retry_count
     connection_retry_count = 0
-    if connect_to_arduino():
+    
+    # 아두이노 재연결
+    arduino_success = connect_to_arduino()
+    
+    # 카메라 재연결
+    camera_success = initialize_camera()
+    
+    if arduino_success:
         socketio.emit('connection_status', {
             'arduino_connected': True,
             'arduino_port': SERIAL_PORT,
+            'camera_connected': camera_status,
+            'camera_device': camera_device if camera_status else 'Not available',
             'message': f'Arduino manually reconnected on {SERIAL_PORT}',
             'retry_count': connection_retry_count,
             'max_retry_count': MAX_RETRY_COUNT
@@ -256,11 +360,18 @@ def handle_reconnect_request():
         socketio.emit('connection_status', {
             'arduino_connected': False,
             'arduino_port': 'Not found',
+            'camera_connected': camera_status,
+            'camera_device': camera_device if camera_status else 'Not available',
             'message': 'Manual reconnection failed - Arduino not found',
             'retry_count': connection_retry_count,
             'max_retry_count': MAX_RETRY_COUNT
         })
         socketio.emit('serial_log', {'data': '[SYSTEM] Manual reconnection failed - Arduino not found'})
+    
+    if camera_success:
+        socketio.emit('serial_log', {'data': f'[SYSTEM] Camera reconnected: {camera_device}'})
+    else:
+        socketio.emit('serial_log', {'data': '[SYSTEM] Camera reconnection failed'})
 
 @socketio.on('request_port_scan')
 def handle_port_scan_request():

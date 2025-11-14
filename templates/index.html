@@ -59,6 +59,7 @@
       <div id="connection-info" style="margin-bottom:10px;font-size:.9em;color:#666;">
         <div>Arduino: <span id="arduino-status" class="status-indicator status-disconnected"></span><span id="arduino-text">Checking connection...</span></div>
         <div>Camera: <span id="camera-status" class="status-indicator status-disconnected"></span><span id="camera-text">Checking connection...</span></div>
+        <div id="camera-device-info" style="font-size:.8em;color:#888;margin-top:5px;"></div>
       </div>
       <div id="glider-container"></div>
     </div>
@@ -85,6 +86,10 @@
         <button class="test-btn" onclick="simulateMovement()">Start Simulation</button>
         <button class="test-btn" onclick="stopSimulation()">Stop Simulation</button>
         <button class="test-btn" onclick="resetGlider()">Reset Glider</button>
+      </div>
+      <div class="test-buttons">
+        <button class="test-btn" onclick="reconnectDevices()" style="background:#27ae60;">Reconnect Devices</button>
+        <button class="test-btn" onclick="scanPorts()" style="background:#f39c12;">Scan Ports</button>
       </div>
       <div class="test-buttons">
         <button class="test-btn" onclick="toggleWireframe()">Toggle Wireframe</button>
@@ -267,52 +272,170 @@
     }
 
     // ===== 센서 데이터 반영 =====
+    // 데이터 필터링을 위한 변수들
+    let sensorHistory = {
+      accX: [], accY: [], accZ: [],
+      gyroX: [], gyroY: [], gyroZ: [],
+      temperature: [], pitch: [], roll: [], yaw: []
+    };
+    const HISTORY_SIZE = 5; // 최근 5개 값으로 평균
+    const MAX_CHANGE_RATE = {
+      acc: 2.0,    // 가속도 최대 변화율
+      gyro: 50.0,  // 자이로 최대 변화율
+      temp: 1.0,   // 온도 최대 변화율
+      pitch: 10.0  // 피치 최대 변화율
+    };
+
+    function smoothValue(current, history, maxChange) {
+      if (history.length === 0) return current;
+      
+      const lastValue = history[history.length - 1];
+      const change = Math.abs(current - lastValue);
+      
+      // 급격한 변화가 감지되면 제한
+      if (change > maxChange) {
+        return lastValue + Math.sign(current - lastValue) * maxChange;
+      }
+      return current;
+    }
+
     function updateSensorData(data){
       // 숫자 필드 안전 처리
       function n(v, d=0){ return (typeof v === 'number' && isFinite(v)) ? v : d; }
-      document.getElementById('acc-x').textContent = n(data.accX).toFixed(2);
-      document.getElementById('acc-y').textContent = n(data.accY).toFixed(2);
-      document.getElementById('acc-z').textContent = n(data.accZ).toFixed(2);
-      document.getElementById('gyro-x').textContent = n(data.gyroX).toFixed(2);
-      document.getElementById('gyro-y').textContent = n(data.gyroY).toFixed(2);
-      document.getElementById('gyro-z').textContent = n(data.gyroZ).toFixed(2);
-      document.getElementById('temperature').textContent = n(data.temperature,25.0).toFixed(1);
-      document.getElementById('pitch').textContent = n(data.pitch).toFixed(1);
+      
+      // 현재 값들
+      const rawAccX = n(data.accX);
+      const rawAccY = n(data.accY);
+      const rawAccZ = n(data.accZ);
+      const rawGyroX = n(data.gyroX);
+      const rawGyroY = n(data.gyroY);
+      const rawGyroZ = n(data.gyroZ);
+      const rawTemp = n(data.temperature, 25.0);
+      const rawPitch = n(data.pitch);
+      
+      // 부드러운 값 계산
+      const smoothAccX = smoothValue(rawAccX, sensorHistory.accX, MAX_CHANGE_RATE.acc);
+      const smoothAccY = smoothValue(rawAccY, sensorHistory.accY, MAX_CHANGE_RATE.acc);
+      const smoothAccZ = smoothValue(rawAccZ, sensorHistory.accZ, MAX_CHANGE_RATE.acc);
+      const smoothGyroX = smoothValue(rawGyroX, sensorHistory.gyroX, MAX_CHANGE_RATE.gyro);
+      const smoothGyroY = smoothValue(rawGyroY, sensorHistory.gyroY, MAX_CHANGE_RATE.gyro);
+      const smoothGyroZ = smoothValue(rawGyroZ, sensorHistory.gyroZ, MAX_CHANGE_RATE.gyro);
+      const smoothTemp = smoothValue(rawTemp, sensorHistory.temperature, MAX_CHANGE_RATE.temp);
+      const smoothPitch = smoothValue(rawPitch, sensorHistory.pitch, MAX_CHANGE_RATE.pitch);
+      
+      // 히스토리 업데이트
+      sensorHistory.accX.push(smoothAccX);
+      sensorHistory.accY.push(smoothAccY);
+      sensorHistory.accZ.push(smoothAccZ);
+      sensorHistory.gyroX.push(smoothGyroX);
+      sensorHistory.gyroY.push(smoothGyroY);
+      sensorHistory.gyroZ.push(smoothGyroZ);
+      sensorHistory.temperature.push(smoothTemp);
+      sensorHistory.pitch.push(smoothPitch);
+      
+      // 히스토리 크기 제한
+      Object.keys(sensorHistory).forEach(key => {
+        if (sensorHistory[key].length > HISTORY_SIZE) {
+          sensorHistory[key].shift();
+        }
+      });
+      
+      // UI 업데이트 (부드러운 값 사용)
+      document.getElementById('acc-x').textContent = smoothAccX.toFixed(2);
+      document.getElementById('acc-y').textContent = smoothAccY.toFixed(2);
+      document.getElementById('acc-z').textContent = smoothAccZ.toFixed(2);
+      document.getElementById('gyro-x').textContent = smoothGyroX.toFixed(2);
+      document.getElementById('gyro-y').textContent = smoothGyroY.toFixed(2);
+      document.getElementById('gyro-z').textContent = smoothGyroZ.toFixed(2);
+      document.getElementById('temperature').textContent = smoothTemp.toFixed(1);
+      document.getElementById('pitch').textContent = smoothPitch.toFixed(1);
 
       if(!glider) return;
 
       const src = ((data.source || '') + '').toUpperCase();
       const now = performance.now();
 
-      // --- 1) DMP 쿼터니언만으로 회전(Processing 축 매핑과 동일) ---
+      // --- 1) DMP 쿼터니언만으로 회전(YPR 폴백과 동일한 축 매핑 적용) ---
       const hasQuat = ['qw','qx','qy','qz'].every(k => typeof data[k] === 'number');
       if (src.startsWith('DMP') && hasQuat) {
-        // axis-angle 추출
-        const qx = data.qx, qy = data.qy, qz = data.qz, qw = data.qw;
-        // 안전한 acos 입력
-        const w = Math.max(-1, Math.min(1, qw));
-        let angle = 2 * Math.acos(w);
-        let s = Math.sqrt(Math.max(0, 1 - w*w));
-        let ax=1, ay=0, az=0;
-        if (s >= 1e-6) { ax = qx/s; ay = qy/s; az = qz/s; }
-        // Processing과 동일한 축 매핑: rotate(angle, -ax, az, ay)
-        const mx = -ax, my = az, mz = ay;
-        const axis = new THREE.Vector3(mx, my, mz);
-        if (axis.lengthSq() > 1e-12) axis.normalize();
-        const qMapped = new THREE.Quaternion().setFromAxisAngle(axis, angle);
-        targetQuat.copy(qMapped);
+        // DMP에서 YPR 값이 있으면 그것을 사용 (YPR 폴백과 동일한 로직)
+        // YPR 값이 없으면 쿼터니언에서 추출
+        if (typeof data.yaw === 'number' && typeof data.roll === 'number' && typeof data.pitch === 'number') {
+          // YPR 값 사용 (YPR 폴백과 동일한 매핑)
+          const roll  = deg2rad(smoothValue(n(data.roll), sensorHistory.roll || [], MAX_CHANGE_RATE.pitch));
+          const pitch = deg2rad(smoothValue(n(data.pitch), sensorHistory.pitch, MAX_CHANGE_RATE.pitch));
+          const yaw   = deg2rad(smoothValue(n(data.yaw), sensorHistory.yaw || [], MAX_CHANGE_RATE.pitch));
+          // Yaw(X) → Roll(Y) → Pitch(Z) - yaw와 roll, roll과 pitch가 교환됨
+          const euler = new THREE.Euler(yaw, roll, pitch, 'XYZ');
+          const qMapped = new THREE.Quaternion().setFromEuler(euler);
+          
+          // 쿼터니언 부드러운 보간을 위한 필터링
+          if (targetQuat.length() > 0) {
+            const dot = Math.abs(targetQuat.dot(qMapped));
+            if (dot < 0.5) {
+              targetQuat.slerp(qMapped, 0.1);
+            } else {
+              targetQuat.copy(qMapped);
+            }
+          } else {
+            targetQuat.copy(qMapped);
+          }
+        } else {
+          // YPR 값이 없으면 쿼터니언에서 오일러로 변환
+          const qx = data.qx, qy = data.qy, qz = data.qz, qw = data.qw;
+          const q = new THREE.Quaternion(qx, qy, qz, qw);
+          q.normalize();
+          
+          // 쿼터니언을 오일러 각으로 변환 (원본 순서: XYZ)
+          const eulerOriginal = new THREE.Euler().setFromQuaternion(q, 'XYZ');
+          
+          // YPR 폴백과 동일한 매핑: yaw(X), roll(Y), pitch(Z)
+          // 원본 오일러에서: X=roll, Y=pitch, Z=yaw (일반적인 항공기 좌표계)
+          // 재매핑: yaw→X, roll→Y, pitch→Z
+          const yaw = eulerOriginal.z;   // 원본 Z축 (yaw)
+          const roll = eulerOriginal.x;  // 원본 X축 (roll)
+          const pitch = eulerOriginal.y; // 원본 Y축 (pitch)
+          
+          // 재매핑된 오일러 각으로 쿼터니언 생성
+          const eulerRemapped = new THREE.Euler(yaw, roll, pitch, 'XYZ');
+          const qMapped = new THREE.Quaternion().setFromEuler(eulerRemapped);
+          
+          // 쿼터니언 부드러운 보간을 위한 필터링
+          if (targetQuat.length() > 0) {
+            const dot = Math.abs(targetQuat.dot(qMapped));
+            if (dot < 0.5) {
+              targetQuat.slerp(qMapped, 0.1);
+            } else {
+              targetQuat.copy(qMapped);
+            }
+          } else {
+            targetQuat.copy(qMapped);
+          }
+        }
         lastDmpAt = now;
         return;
       }
 
       // --- 2) DMP가 없거나(초기) 장시간 끊기면 YPR로 폴백(>300ms) ---
       if (now - lastDmpAt > 300) {
-        const roll  = deg2rad(n(data.roll));
-        const pitch = deg2rad(n(data.pitch));
-        const yaw   = deg2rad(n(data.yaw));
-        // Yaw(Z) → Pitch(Y) → Roll(X)
-        const euler = new THREE.Euler(roll, pitch, yaw, 'XYZ');
-        targetQuat.setFromEuler(euler);
+        const roll  = deg2rad(smoothValue(n(data.roll), sensorHistory.roll || [], MAX_CHANGE_RATE.pitch));
+        const pitch = deg2rad(smoothValue(n(data.pitch), sensorHistory.pitch, MAX_CHANGE_RATE.pitch));
+        const yaw   = deg2rad(smoothValue(n(data.yaw), sensorHistory.yaw || [], MAX_CHANGE_RATE.pitch));
+        // Yaw(X) → Roll(Y) → Pitch(Z) - yaw와 roll, roll과 pitch가 교환됨
+        const euler = new THREE.Euler(yaw, roll, pitch, 'XYZ');
+        const newQuat = new THREE.Quaternion().setFromEuler(euler);
+        
+        // YPR에도 부드러운 보간 적용
+        if (targetQuat.length() > 0) {
+          const dot = Math.abs(targetQuat.dot(newQuat));
+          if (dot < 0.5) {
+            targetQuat.slerp(newQuat, 0.1);
+          } else {
+            targetQuat.copy(newQuat);
+          }
+        } else {
+          targetQuat.copy(newQuat);
+        }
       }
       // 그 외(최근 DMP 유지 중)에는 폴백 프레임의 회전값은 무시하여 흔들림 제거
     }
@@ -337,6 +460,15 @@
     function stopSimulation(){ if(simulationInterval){ clearInterval(simulationInterval); simulationInterval=null; } isSimulating=false; addLogMessage('Simulation stopped'); }
     function resetGlider(){
       if(glider){ glider.rotation.set(0,0,0); glider.position.set(0,0,0); glider.quaternion.identity(); }
+      
+      // 센서 히스토리 초기화
+      Object.keys(sensorHistory).forEach(key => {
+        sensorHistory[key] = [];
+      });
+      
+      // 타겟 쿼터니언 초기화
+      targetQuat.identity();
+      
       updateSensorData({accX:0,accY:0,accZ:9.8,gyroX:0,gyroY:0,gyroZ:0,temperature:25.0,pitch:0.0, source:'RESET'});
       addLogMessage('Glider reset to initial position');
     }
@@ -359,10 +491,29 @@
     function updateConnectionStatus(status){
       const as = document.getElementById('arduino-status'), at = document.getElementById('arduino-text');
       const cs = document.getElementById('camera-status'), ct = document.getElementById('camera-text');
-      if(status.arduino_connected){ as.className='status-indicator status-connected'; at.textContent=`Connected (${status.arduino_port})`; }
-      else { as.className='status-indicator status-disconnected'; at.textContent='Disconnected'; }
-      if(status.camera_connected){ cs.className='status-indicator status-connected'; ct.textContent='Connected'; }
-      else { cs.className='status-indicator status-disconnected'; ct.textContent='Disconnected'; }
+      const cdi = document.getElementById('camera-device-info');
+      
+      if(status.arduino_connected){ 
+        as.className='status-indicator status-connected'; 
+        at.textContent=`Connected (${status.arduino_port})`; 
+      } else { 
+        as.className='status-indicator status-disconnected'; 
+        at.textContent='Disconnected'; 
+      }
+      
+      if(status.camera_connected){ 
+        cs.className='status-indicator status-connected'; 
+        ct.textContent='Connected';
+        if(status.camera_device && status.camera_device !== 'Not available') {
+          cdi.textContent = `Device: ${status.camera_device}`;
+        } else {
+          cdi.textContent = '';
+        }
+      } else { 
+        cs.className='status-indicator status-disconnected'; 
+        ct.textContent='Disconnected';
+        cdi.textContent = 'No camera available';
+      }
     }
 
     // ===== Socket.IO 연결 =====
@@ -376,16 +527,25 @@
       socket.on('serial_log', msg => addLogMessage(msg.data));
       let lastSensorLogTs=0;
       socket.on('sensor_update', data=>{
-        updateSensorData(data);
+        updateSensorData(data); // 3D 모델은 실시간 업데이트
         const now = Date.now();
-        if(now - lastSensorLogTs > 1000){
-          addLogMessage(`Sensor data received: src=${data.source||'N/A'} pitch=${(+data.pitch||0).toFixed(1)} yaw=${(+data.yaw||0).toFixed(1)} roll=${(+data.roll||0).toFixed(1)}`);
+        // 로그만 5초마다 출력
+        if(now - lastSensorLogTs > 5000){
+          addLogMessage(`Sensor data: pitch=${(+data.pitch||0).toFixed(1)}° yaw=${(+data.yaw||0).toFixed(1)}° roll=${(+data.roll||0).toFixed(1)}°`);
           lastSensorLogTs = now;
         }
       });
       socket.on('connection_status', status=>{
         updateConnectionStatus(status);
         addLogMessage(`Connection status updated: Arduino(${status.arduino_connected?'Connected':'Disconnected'}), Camera(${status.camera_connected?'Connected':'Disconnected'})`);
+      });
+      socket.on('port_scan_results', data=>{
+        addLogMessage(`Port scan completed: ${data.message}`);
+        data.ports.forEach(port=>{
+          if(port.available) {
+            addLogMessage(`  Found Arduino on ${port.port}: ${port.response}`);
+          }
+        });
       });
 
       window.sendCommand = ()=>{ const c = commandInput.value.trim(); if(c){ socket.emit('control_event',{command:c}); addLogMessage(`Command sent: ${c}`); commandInput.value=''; } };
@@ -397,6 +557,8 @@
       window.startGPSDemo = startGPSDemo;
       window.stopGPSDemo = stopGPSDemo;
       window.changeGPSPath = changeGPSPath;
+      window.reconnectDevices = ()=>{ socket.emit('request_reconnect'); addLogMessage('Reconnection requested'); };
+      window.scanPorts = ()=>{ socket.emit('request_port_scan'); addLogMessage('Port scan requested'); };
 
       commandInput.addEventListener('keydown', e=>{ if(e.key==='Enter') sendCommand(); });
 
