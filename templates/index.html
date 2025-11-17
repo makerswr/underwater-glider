@@ -6,21 +6,21 @@
   <title>Underwater Glider Control System</title>
   <style>
     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin:0; background:#f5f7fa; color:#333; overflow-x:hidden; }
-    .container { display:grid; grid-template-columns:1fr 1fr 1fr; grid-template-rows:1fr 1fr; gap:20px; padding:20px; height:100vh; box-sizing:border-box; }
+    .container { display:grid; grid-template-columns:1fr 1fr 1fr; grid-template-rows:auto 1fr; gap:20px; padding:20px; min-height:100vh; box-sizing:border-box; overflow-y:auto; }
     .panel { background:#fff; border-radius:12px; box-shadow:0 4px 20px rgba(0,0,0,.1); padding:20px; border:1px solid #e1e8ed; }
     .camera-panel { grid-column:1; grid-row:1; display:flex; flex-direction:column; overflow:hidden; }
     .glider-panel { grid-column:1; grid-row:2; display:flex; flex-direction:column; overflow:hidden; }
-    .sensor-panel { grid-column:2; grid-row:1; display:flex; flex-direction:column; overflow:hidden; }
-    .control-panel { grid-column:2; grid-row:2; display:flex; flex-direction:column; overflow:hidden; }
+    .sensor-panel { grid-column:2; grid-row:1; display:flex; flex-direction:column; overflow:visible; }
+    .control-panel { grid-column:2; grid-row:2; display:flex; flex-direction:column; overflow:auto; }
     .map-panel { grid-column:3; grid-row:1 / 3; display:flex; flex-direction:column; overflow:hidden; }
     h2 { margin-top:0; color:#2c3e50; text-align:center; border-bottom:2px solid #3498db; padding-bottom:10px; }
     #glider-container, #map-container { flex:1; border-radius:8px; background:#fff; position:relative; overflow:hidden; border:1px solid #dee2e6; }
-    #sensor-data { display:grid; grid-template-columns:1fr 1fr; gap:10px; flex:1; overflow-y:auto; }
+    #sensor-data { display:grid; grid-template-columns:1fr 1fr; gap:10px; flex:0 0 auto; overflow-y:auto; max-height:26vh; min-height:160px; }
     .sensor-item { background:#3498db; color:#fff; padding:10px; border-radius:8px; text-align:center; box-shadow:0 2px 8px rgba(0,0,0,.1); display:flex; flex-direction:column; justify-content:center; }
     .sensor-label { font-size:.9em; opacity:.9; margin-bottom:5px; }
     .sensor-value { font-size:1.2em; font-weight:bold; font-family:'Courier New', monospace; }
     .sensor-unit { font-size:.8em; opacity:.8; }
-    #log-console { background:#2c3e50; color:#ecf0f1; padding:15px; border-radius:8px; flex:1; overflow-y:scroll; font-family:'Courier New', monospace; font-size:.9em; border:1px solid #34495e; }
+    #log-console { background:#2c3e50; color:#ecf0f1; padding:15px; border-radius:8px; flex:1; overflow-y:scroll; font-family:'Courier New', monospace; font-size:.9em; border:1px solid #34495e; min-height:200px; height:28vh; }
     #log-console p { margin:2px 0; }
     .control-group { display:flex; gap:10px; margin-bottom:20px; }
     .control-group input { flex-grow:1; padding:12px; border:2px solid #ddd; border-radius:6px; font-size:1em; transition:border-color .3s; }
@@ -33,6 +33,7 @@
     .status-indicator { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
     .status-connected { background:#27ae60; }
     .status-disconnected { background:#e74c3c; }
+    .param-hint { font-size:.85em; color:#666; align-self:center; }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -97,6 +98,57 @@
       </div>
       <div class="test-buttons">
         <button class="test-btn" onclick="startPreMission()" style="background:#8e44ad;">Start Pre-Mission Route</button>
+      </div>
+      <!-- Mission Config -->
+      <div class="test-buttons">
+        <select id="mission-pattern">
+          <option value="sawtooth_pitch">Sawtooth Pitch</option>
+          <option value="pitch_only_test">Pitch Only Test</option>
+          <option value="small_box_turn">Small Box Turn</option>
+          <option value="custom_segments">Custom Segments</option>
+        </select>
+        <button class="test-btn" onclick="startMission()" style="background:#8e44ad;">Start Mission</button>
+      </div>
+      <!-- sawtooth & pitch_only_test -->
+      <div id="params-sawtooth" class="test-buttons">
+        <span class="param-hint">Pitch step (M1 ±steps)</span><input id="pitch-step" type="number" value="200" placeholder="pitch_step" />
+        <span class="param-hint">Segment time (seconds)</span><input id="segment-time" type="number" value="2.0" step="0.1" placeholder="segment_time(s)" />
+        <span class="param-hint">Start delay (seconds)</span><input id="start-delay" type="number" value="20.0" step="0.1" placeholder="start_delay(s)" />
+        <span class="param-hint">Repeat (cycles)</span><input id="repeat" type="number" value="5" placeholder="repeat" />
+      </div>
+      <div id="params-pitch-test" class="test-buttons" style="display:none;">
+        <span class="param-hint">Pitch step (M1 ±steps)</span><input id="pt-pitch-step" type="number" value="200" placeholder="pitch_step" />
+        <span class="param-hint">Segment time (seconds)</span><input id="pt-segment-time" type="number" value="2.0" step="0.1" placeholder="segment_time(s)" />
+        <span class="param-hint">Start delay (seconds)</span><input id="pt-start-delay" type="number" value="5.0" step="0.1" placeholder="start_delay(s)" />
+      </div>
+      <!-- small_box_turn -->
+      <div id="params-small-box" class="test-buttons" style="display:none;">
+        <span class="param-hint">Pitch step (M1 ±steps)</span><input id="sb-pitch-step" type="number" value="200" placeholder="pitch_step" />
+        <span class="param-hint">Turn step (M2 +steps)</span><input id="sb-turn-step" type="number" value="200" placeholder="turn_step" />
+        <span class="param-hint">Forward time (seconds)</span><input id="sb-seg-forward" type="number" value="2.0" step="0.1" placeholder="segment_time_forward(s)" />
+        <span class="param-hint">Turn time (seconds)</span><input id="sb-seg-turn" type="number" value="1.0" step="0.1" placeholder="segment_time_turn(s)" />
+        <span class="param-hint">Start delay (seconds)</span><input id="sb-start-delay" type="number" value="5.0" step="0.1" placeholder="start_delay(s)" />
+        <span class="param-hint">Repeat (cycles)</span><input id="sb-repeat" type="number" value="4" placeholder="repeat" />
+      </div>
+      <!-- custom_segments -->
+      <div id="params-custom" style="display:none; margin:10px 0;">
+        <div class="test-buttons">
+          <span class="param-hint">Start delay (seconds)</span><input id="custom-start-delay" type="number" value="5.0" step="0.1" placeholder="start_delay(s)" />
+          <button class="test-btn" onclick="addCustomSegmentRow()">Add Segment</button>
+        </div>
+        <div style="max-height:150px; overflow:auto; border:1px solid #e1e8ed; border-radius:6px; padding:6px; background:#fafbfc;">
+          <table id="custom-segments-table" style="width:100%; border-collapse:collapse;">
+            <thead>
+              <tr style="text-align:left;">
+                <th style="padding:6px;">M1 steps (pitch)</th>
+                <th style="padding:6px;">M2 steps (turn)</th>
+                <th style="padding:6px;">Wait after (s)</th>
+                <th style="padding:6px;">Actions</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
       </div>
       <div class="test-buttons">
         <select id="gps-path" onchange="changeGPSPath(this.value)">
@@ -573,6 +625,98 @@
         socket.emit('start_mission', mission);
         addLogMessage('Pre-mission sawtooth_pitch started');
       };
+      // ===== Mission UI/Logic =====
+      function updateMissionUI(){
+        const p = document.getElementById('mission-pattern').value;
+        document.getElementById('params-sawtooth').style.display = (p==='sawtooth_pitch') ? '' : 'none';
+        document.getElementById('params-pitch-test').style.display = (p==='pitch_only_test') ? '' : 'none';
+        document.getElementById('params-small-box').style.display = (p==='small_box_turn') ? '' : 'none';
+        document.getElementById('params-custom').style.display = (p==='custom_segments') ? '' : 'none';
+      }
+      function addCustomSegmentRow(m1=0, m2=0, wait=1.0){
+        const tbody = document.querySelector('#custom-segments-table tbody');
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td style="padding:4px;"><input type="number" value="${m1}" step="1" style="width:100%;" /></td>
+          <td style="padding:4px;"><input type="number" value="${m2}" step="1" style="width:100%;" /></td>
+          <td style="padding:4px;"><input type="number" value="${wait}" step="0.1" style="width:100%;" /></td>
+          <td style="padding:4px;"><button class="test-btn" style="background:#e74c3c;" onclick="this.closest('tr').remove()">Remove</button></td>
+        `;
+        tbody.appendChild(tr);
+      }
+      function readCustomSegments(){
+        const rows = Array.from(document.querySelectorAll('#custom-segments-table tbody tr'));
+        return rows.map(r=>{
+          const inputs = r.querySelectorAll('input');
+          return {
+            m1: Number(inputs[0].value||0),
+            m2: Number(inputs[1].value||0),
+            wait: Number(inputs[2].value||0)
+          };
+        }).filter(s=>Number.isFinite(s.m1) && Number.isFinite(s.m2) && Number.isFinite(s.wait));
+      }
+      window.startMission = ()=>{
+        const pattern = document.getElementById('mission-pattern').value;
+        if(pattern==='sawtooth_pitch'){
+          const mission = {
+            pattern: 'sawtooth_pitch',
+            params: {
+              pitch_step: Number(document.getElementById('pitch-step').value),
+              segment_time: Number(document.getElementById('segment-time').value),
+              start_delay: Number(document.getElementById('start-delay').value),
+              repeat: Number(document.getElementById('repeat').value)
+            }
+          };
+          socket.emit('start_mission', mission);
+          addLogMessage('Mission requested: sawtooth_pitch');
+          return;
+        }
+        if(pattern==='pitch_only_test'){
+          const mission = {
+            pattern: 'pitch_only_test',
+            params: {
+              pitch_step: Number(document.getElementById('pt-pitch-step').value),
+              segment_time: Number(document.getElementById('pt-segment-time').value),
+              start_delay: Number(document.getElementById('pt-start-delay').value)
+            }
+          };
+          socket.emit('start_mission', mission);
+          addLogMessage('Mission requested: pitch_only_test');
+          return;
+        }
+        if(pattern==='small_box_turn'){
+          const mission = {
+            pattern: 'small_box_turn',
+            params: {
+              pitch_step: Number(document.getElementById('sb-pitch-step').value),
+              turn_step: Number(document.getElementById('sb-turn-step').value),
+              segment_time_forward: Number(document.getElementById('sb-seg-forward').value),
+              segment_time_turn: Number(document.getElementById('sb-seg-turn').value),
+              start_delay: Number(document.getElementById('sb-start-delay').value),
+              repeat: Number(document.getElementById('sb-repeat').value)
+            }
+          };
+          socket.emit('start_mission', mission);
+          addLogMessage('Mission requested: small_box_turn');
+          return;
+        }
+        if(pattern==='custom_segments'){
+          const mission = {
+            pattern: 'custom_segments',
+            segments: readCustomSegments(),
+            start_delay: Number(document.getElementById('custom-start-delay').value)
+          };
+          socket.emit('start_mission', mission);
+          addLogMessage(`Mission requested: custom_segments (${mission.segments.length} segments)`);
+          return;
+        }
+      };
+      // 초기화
+      document.getElementById('mission-pattern').addEventListener('change', updateMissionUI);
+      updateMissionUI();
+      // 기본 커스텀 세그먼트 2줄(200,0 / -200,0)
+      addCustomSegmentRow(200, 0, 2.0);
+      addCustomSegmentRow(-200, 0, 2.0);
 
       commandInput.addEventListener('keydown', e=>{ if(e.key==='Enter') sendCommand(); });
 

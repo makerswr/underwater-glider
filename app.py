@@ -27,6 +27,8 @@ JPEG_QUALITY = int(os.getenv('JPEG_QUALITY', '70'))
 mission_running = False
 mission_config = None
 mission_thread = None
+current_mission = None
+stop_flag = False
 
 # --- 아두이노 연결 설정 ---
 BAUD_RATE = 115200
@@ -155,6 +157,23 @@ def send_serial_command(command_line: str) -> bool:
         if "device not found" in str(e).lower() or "permission denied" in str(e).lower():
             print("🔄 Connection error during command send - attempting reconnection")
             reconnect_arduino()
+        return False
+
+# 미션용 간단 헬퍼: m1/m2 정수 스텝 전송(+미션 로그)
+def send_cmd(m1: int, m2: int) -> bool:
+    global ser
+    try:
+        serial_line = f"{int(m1)},{int(m2)}\n"
+        if not ser or not ser.is_open:
+            print("⚠️ Arduino not connected - attempting reconnection before sending command")
+            if not reconnect_arduino():
+                socketio.emit('serial_log', {'data': '[MISSION] ERROR: Cannot send command - Arduino not connected'})
+                return False
+        ser.write(serial_line.encode('utf-8'))
+        socketio.emit('serial_log', {'data': f"[MISSION] Sent: {serial_line.strip()}"})
+        return True
+    except Exception as e:
+        socketio.emit('serial_log', {'data': f"[MISSION] ERROR sending command: {e}"})
         return False
 
 # --- 카메라 초기화 ---
@@ -491,62 +510,135 @@ def handle_simulation_request():
     socketio.emit('sensor_update', mock_data)
     print(f"[SIMULATION] Mock sensor data sent: {mock_data}")
 
-@socketio.on('start_mission')
-def handle_start_mission(cfg):
-    global mission_running, mission_config, mission_thread
+def _coerce_int(v, default=0):
     try:
-        socketio.emit('serial_log', {'data': '[MISSION] Start requested'})
+        return int(float(v))
+    except Exception:
+        return int(default)
+
+def _coerce_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+def build_segments_from_pattern(pattern: str, params: dict):
+    """
+    패턴과 파라미터를 입력으로 받아 실행 가능한 세그먼트 목록과 start_delay를 생성합니다.
+    각 세그먼트는 {'m1': int, 'm2': int, 'wait': float, 'label': str} 형태입니다.
+    """
+    pattern = (pattern or '').strip()
+    p = params or {}
+    segments = []
+    start_delay = _coerce_float(p.get('start_delay', p.get('delay', 0.0)), 0.0)
+
+    if pattern == 'sawtooth_pitch':
+        pitch_step = _coerce_int(p.get('pitch_step', 200), 200)
+        segment_time = max(0.0, _coerce_float(p.get('segment_time', 2.0), 2.0))
+        repeat = max(0, _coerce_int(p.get('repeat', 5), 5))
+        for i in range(1, repeat + 1):
+            segments.append({'m1': +pitch_step, 'm2': 0, 'wait': segment_time, 'label': f"Cycle {i}/{repeat}: command {+pitch_step},0"})
+            segments.append({'m1': -pitch_step, 'm2': 0, 'wait': segment_time, 'label': f"Cycle {i}/{repeat}: command {-pitch_step},0"})
+        return segments, start_delay
+
+    if pattern == 'pitch_only_test':
+        pitch_step = _coerce_int(p.get('pitch_step', 200), 200)
+        segment_time = max(0.0, _coerce_float(p.get('segment_time', 2.0), 2.0))
+        segments.append({'m1': +pitch_step, 'm2': 0, 'wait': segment_time, 'label': f"Pitch test: command {+pitch_step},0"})
+        segments.append({'m1': -pitch_step, 'm2': 0, 'wait': segment_time, 'label': f"Pitch test: command {-pitch_step},0"})
+        return segments, start_delay
+
+    if pattern == 'small_box_turn':
+        pitch_step = _coerce_int(p.get('pitch_step', 200), 200)
+        turn_step = _coerce_int(p.get('turn_step', 200), 200)
+        seg_fwd = max(0.0, _coerce_float(p.get('segment_time_forward', 2.0), 2.0))
+        seg_turn = max(0.0, _coerce_float(p.get('segment_time_turn', 1.0), 1.0))
+        repeat = max(0, _coerce_int(p.get('repeat', 4), 4))
+        for i in range(1, repeat + 1):
+            segments.append({'m1': +pitch_step, 'm2': 0, 'wait': seg_fwd,  'label': f"Cycle {i}/{repeat}: forward +{pitch_step},0"})
+            segments.append({'m1': 0,           'm2': +turn_step, 'wait': seg_turn, 'label': f"Cycle {i}/{repeat}: turn 0,+{turn_step}"})
+            segments.append({'m1': -pitch_step, 'm2': 0, 'wait': seg_fwd,  'label': f"Cycle {i}/{repeat}: forward -{pitch_step},0"})
+            segments.append({'m1': 0,           'm2': +turn_step, 'wait': seg_turn, 'label': f"Cycle {i}/{repeat}: turn 0,+{turn_step}"})
+        return segments, start_delay
+
+    # 미지원 패턴
+    return None, start_delay
+
+@socketio.on('start_mission')
+def handle_start_mission(mission_json):
+    global mission_running, mission_thread, current_mission, stop_flag
+    try:
+        if not isinstance(mission_json, dict):
+            socketio.emit('serial_log', {'data': '[MISSION] Invalid mission JSON'})
+            return
+        pattern = (mission_json.get('pattern') or '').strip()
+        socketio.emit('serial_log', {'data': f'[MISSION] Start requested: pattern={pattern}'})
         if mission_running:
-            socketio.emit('serial_log', {'data': '[MISSION] Already running - rejecting new start'}); 
+            socketio.emit('serial_log', {'data': '[MISSION] Already running - rejecting new start'})
             return
-        if not isinstance(cfg, dict):
-            socketio.emit('serial_log', {'data': '[MISSION] Invalid config: not a dict'})
-            return
-        pattern = (cfg.get('pattern') or '').strip()
-        if pattern != 'sawtooth_pitch':
-            socketio.emit('serial_log', {'data': f"[MISSION] Unsupported pattern: {pattern}"})
-            return
-        # 파라미터 파싱/검증
-        try:
-            pitch_step = int(cfg.get('pitch_step', 200))
-            segment_time = float(cfg.get('segment_time', 2.0))
-            start_delay = float(cfg.get('start_delay', 20.0))
-            repeat = int(cfg.get('repeat', 5))
-        except Exception:
-            socketio.emit('serial_log', {'data': '[MISSION] Invalid parameter types'})
-            return
-        mission_config = {
-            'pattern': 'sawtooth_pitch',
-            'pitch_step': pitch_step,
-            'segment_time': max(0.0, segment_time),
-            'start_delay': max(0.0, start_delay),
-            'repeat': max(0, repeat),
-        }
+
+        # custom_segments 모드
+        if pattern == 'custom_segments':
+            segments_list = mission_json.get('segments') or []
+            if not isinstance(segments_list, list) or len(segments_list) == 0:
+                socketio.emit('serial_log', {'data': '[MISSION] custom_segments requires non-empty "segments" array'})
+                return
+            # 세그먼트 정규화
+            norm_segments = []
+            for idx, seg in enumerate(segments_list, start=1):
+                try:
+                    m1 = _coerce_int(seg.get('m1', 0), 0)
+                    m2 = _coerce_int(seg.get('m2', 0), 0)
+                    w = max(0.0, _coerce_float(seg.get('wait', 0.0), 0.0))
+                    norm_segments.append({'m1': m1, 'm2': m2, 'wait': w, 'label': f"Segment {idx}: command {m1},{m2}"})
+                except Exception:
+                    socketio.emit('serial_log', {'data': f'[MISSION] Invalid segment at index {idx-1}'})
+                    return
+            start_delay = max(0.0, _coerce_float(mission_json.get('start_delay', 0.0), 0.0))
+            current_mission = {'pattern': 'custom_segments', 'segments': norm_segments, 'start_delay': start_delay}
+        else:
+            # 패턴 기반: params 또는 구 포맷 호환
+            params = mission_json.get('params')
+            if not isinstance(params, dict):
+                # 구(이전) 포맷 호환: 상위 키에서 파라미터 읽기
+                params = {k: mission_json.get(k) for k in ['pitch_step','segment_time','start_delay','repeat','turn_step','segment_time_forward','segment_time_turn'] if k in mission_json}
+            segments, start_delay = build_segments_from_pattern(pattern, params)
+            if not segments:
+                socketio.emit('serial_log', {'data': f'[MISSION] Unsupported or invalid pattern: {pattern}'})
+                return
+            current_mission = {'pattern': pattern, 'segments': segments, 'start_delay': max(0.0, _coerce_float(start_delay, 0.0))}
+
         # 워커 스레드 시작
-        mission_thread = threading.Thread(target=mission_worker, args=(mission_config,), daemon=True)
+        stop_flag = False
+        mission_thread = threading.Thread(target=mission_worker, args=(current_mission,), daemon=True)
         mission_thread.start()
     except Exception as e:
         socketio.emit('serial_log', {'data': f'[MISSION] Error: {e}'})
 
-def mission_worker(cfg):
-    global mission_running
+def mission_worker(mission_cfg: dict):
+    global mission_running, stop_flag
     mission_running = True
     try:
-        step = cfg['pitch_step']; seg = cfg['segment_time']; delay = cfg['start_delay']; rep = cfg['repeat']
-        socketio.emit('serial_log', {'data': f"[MISSION] Starting sawtooth_pitch: step={step}, segment_time={seg}, repeat={rep}, start_delay={delay}"})
-        if delay > 0:
-            socketio.emit('serial_log', {'data': f"[MISSION] Waiting {delay:.1f}s before dive"})
-            time.sleep(delay)
-        for i in range(1, rep + 1):
-            cmd1 = f"{+step},0"
-            socketio.emit('serial_log', {'data': f"[MISSION] Cycle {i}/{rep}: command {cmd1}"})
-            send_serial_command(cmd1)
-            time.sleep(seg)
-            cmd2 = f"{-step},0"
-            socketio.emit('serial_log', {'data': f"[MISSION] Cycle {i}/{rep}: command {cmd2}"})
-            send_serial_command(cmd2)
-            time.sleep(seg)
-        socketio.emit('serial_log', {'data': "[MISSION] Completed sawtooth_pitch mission"})
+        pattern = mission_cfg.get('pattern')
+        segments = mission_cfg.get('segments') or []
+        start_delay = float(mission_cfg.get('start_delay') or 0.0)
+        socketio.emit('serial_log', {'data': f"[MISSION] Starting {pattern}: segments={len(segments)}, start_delay={start_delay}"})
+        if start_delay > 0:
+            socketio.emit('serial_log', {'data': f"[MISSION] Waiting {start_delay:.1f}s before first command"})
+            time.sleep(start_delay)
+        for seg in segments:
+            if stop_flag:
+                socketio.emit('serial_log', {'data': "[MISSION] Stopped"})
+                break
+            label = seg.get('label') or f"Command {seg.get('m1',0)},{seg.get('m2',0)}"
+            socketio.emit('serial_log', {'data': f"[MISSION] {label}"})
+            send_cmd(seg.get('m1', 0), seg.get('m2', 0))
+            wait_s = float(seg.get('wait', 0.0))
+            if wait_s > 0:
+                time.sleep(wait_s)
+                socketio.emit('serial_log', {'data': f"[MISSION] Waited {wait_s:.1f}s"})
+        else:
+            socketio.emit('serial_log', {'data': f"[MISSION] Completed {pattern}"})
     except Exception as e:
         socketio.emit('serial_log', {'data': f"[MISSION] Runtime error: {e}"})
     finally:
