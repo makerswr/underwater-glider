@@ -15,6 +15,19 @@ CORS(app)
 # 크로스 도메인 허용 명시 (Socket.IO 4 클라이언트와 혼선 방지)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+# --- 영상 스트리밍 성능 최적화(저지연) 공유 상태 ---
+cv2.setUseOptimized(True)
+latest_jpeg = None
+latest_lock = threading.Lock()
+camera_thread = None
+TARGET_ENCODE_FPS = 20  # 인코딩 목표 FPS
+JPEG_QUALITY = int(os.getenv('JPEG_QUALITY', '70'))
+
+# --- 미션 상태 ---
+mission_running = False
+mission_config = None
+mission_thread = None
+
 # --- 아두이노 연결 설정 ---
 BAUD_RATE = 115200
 ser = None
@@ -120,6 +133,30 @@ def reconnect_arduino():
 # 초기 연결 시도
 connect_to_arduino()
 
+# --- 직렬 송신 헬퍼 ---
+def send_serial_command(command_line: str) -> bool:
+    try:
+        if not command_line.endswith('\n'):
+            command_line = f"{command_line}\n"
+        if not ser or not ser.is_open:
+            print("⚠️ Arduino not connected - attempting reconnection before sending command")
+            if not reconnect_arduino():
+                socketio.emit('serial_log', {'data': '[ERROR] Cannot send command - Arduino not connected'})
+                return False
+        ser.write(command_line.encode('utf-8'))
+        log_message = f"[SENT] {command_line.strip()}"
+        print(log_message)
+        socketio.emit('serial_log', {'data': log_message})
+        return True
+    except Exception as e:
+        error_msg = f"[ERROR] Failed to send command: {e}"
+        print(error_msg)
+        socketio.emit('serial_log', {'data': error_msg})
+        if "device not found" in str(e).lower() or "permission denied" in str(e).lower():
+            print("🔄 Connection error during command send - attempting reconnection")
+            reconnect_arduino()
+        return False
+
 # --- 카메라 초기화 ---
 camera = None
 camera_status = False
@@ -196,6 +233,11 @@ def initialize_camera():
             camera = cv2.VideoCapture(camera_device)
             
         if camera.isOpened():
+            # 카메라로부터 MJPG 포맷을 요청(지원 시 CPU 부하 감소)
+            try:
+                camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            except Exception:
+                pass
             # 카메라 설정
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -208,6 +250,12 @@ def initialize_camera():
                 camera_status = True
                 print(f"✅ Camera initialized successfully: {camera_device}")
                 print(f"   Frame size: {frame.shape}")
+                # 백그라운드 캡처 스레드 시작
+                try:
+                    start_camera_capture_thread()
+                except NameError:
+                    # 함수 정의 순서로 인한 임시 예외 방지
+                    pass
                 return True
             else:
                 print(f"⚠️ Camera opened but cannot read frames: {camera_device}")
@@ -224,6 +272,39 @@ def initialize_camera():
         print(f"⚠️ Camera initialization failed: {e}")
         camera_status = False
         return False
+
+# --- 저지연 캡처/프리인코딩 스레드 ---
+def camera_capture_worker():
+    global latest_jpeg
+    last_encode = 0.0
+    encode_interval = 1.0 / max(1, TARGET_ENCODE_FPS)
+    while True:
+        try:
+            if camera and camera_status and camera.isOpened():
+                success, frame = camera.read()
+                if not success or frame is None:
+                    time.sleep(0.005)
+                    continue
+                now = time.time()
+                if now - last_encode < encode_interval:
+                    continue
+                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)])
+                if ok:
+                    data = buf.tobytes()
+                    with latest_lock:
+                        latest_jpeg = data
+                    last_encode = now
+            else:
+                time.sleep(0.1)
+        except Exception:
+            time.sleep(0.02)
+
+def start_camera_capture_thread():
+    global camera_thread
+    if camera_thread and camera_thread.is_alive():
+        return
+    camera_thread = threading.Thread(target=camera_capture_worker, daemon=True)
+    camera_thread.start()
 
 # 카메라 초기화 실행
 initialize_camera()
@@ -284,28 +365,25 @@ def arduino_reader_thread():
 def generate_frames():
     import numpy as np
     while True:
-        if camera and camera_status and camera.isOpened():
-            success, frame = camera.read()
-            if not success:
-                time.sleep(0.1); continue
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
+        with latest_lock:
+            payload = latest_jpeg
+        if payload:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + payload + b'\r\n')
+            time.sleep(max(0.0, 1.0 / max(1, TARGET_ENCODE_FPS)))
+            continue
+        # 초기 대기 또는 카메라 미가용 시 플레이스홀더 출력
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(frame, "Camera Not Available", (200, 240),
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(frame, "Glider Control System Active", (150, 280),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if ret:
             frame_bytes = buffer.tobytes()
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        else:
-            frame = np.zeros((480, 640, 3), dtype=np.uint8)
-            cv2.putText(frame, "Camera Not Available", (200, 240),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            cv2.putText(frame, "Glider Control System Active", (150, 280),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if ret:
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(1)
+        time.sleep(0.1)
 
 @app.route('/')
 def index():
@@ -313,7 +391,13 @@ def index():
 
 @app.route('/video_feed')
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    headers = {
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+        'X-Accel-Buffering': 'no'
+    }
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame', headers=headers)
 
 @socketio.on('connect')
 def handle_connect():
@@ -388,24 +472,7 @@ def handle_port_scan_request():
 def handle_control_event(json_data):
     command_to_send = json_data.get('command')
     if command_to_send:
-        if not ser or not ser.is_open:
-            print("⚠️ Arduino not connected - attempting reconnection before sending command")
-            if not reconnect_arduino():
-                socketio.emit('serial_log', {'data': '[ERROR] Cannot send command - Arduino not connected'})
-                return
-        try:
-            serial_command = f"{command_to_send}\n"
-            ser.write(serial_command.encode('utf-8'))
-            log_message = f"[SENT] {serial_command.strip()}"
-            print(log_message)
-            socketio.emit('serial_log', {'data': log_message})
-        except Exception as e:
-            error_msg = f"[ERROR] Failed to send command: {e}"
-            print(error_msg)
-            socketio.emit('serial_log', {'data': error_msg})
-            if "device not found" in str(e).lower() or "permission denied" in str(e).lower():
-                print("🔄 Connection error during command send - attempting reconnection")
-                reconnect_arduino()
+        send_serial_command(command_to_send)
 
 @socketio.on('request_simulation')
 def handle_simulation_request():
@@ -424,5 +491,66 @@ def handle_simulation_request():
     socketio.emit('sensor_update', mock_data)
     print(f"[SIMULATION] Mock sensor data sent: {mock_data}")
 
+@socketio.on('start_mission')
+def handle_start_mission(cfg):
+    global mission_running, mission_config, mission_thread
+    try:
+        socketio.emit('serial_log', {'data': '[MISSION] Start requested'})
+        if mission_running:
+            socketio.emit('serial_log', {'data': '[MISSION] Already running - rejecting new start'}); 
+            return
+        if not isinstance(cfg, dict):
+            socketio.emit('serial_log', {'data': '[MISSION] Invalid config: not a dict'})
+            return
+        pattern = (cfg.get('pattern') or '').strip()
+        if pattern != 'sawtooth_pitch':
+            socketio.emit('serial_log', {'data': f"[MISSION] Unsupported pattern: {pattern}"})
+            return
+        # 파라미터 파싱/검증
+        try:
+            pitch_step = int(cfg.get('pitch_step', 200))
+            segment_time = float(cfg.get('segment_time', 2.0))
+            start_delay = float(cfg.get('start_delay', 20.0))
+            repeat = int(cfg.get('repeat', 5))
+        except Exception:
+            socketio.emit('serial_log', {'data': '[MISSION] Invalid parameter types'})
+            return
+        mission_config = {
+            'pattern': 'sawtooth_pitch',
+            'pitch_step': pitch_step,
+            'segment_time': max(0.0, segment_time),
+            'start_delay': max(0.0, start_delay),
+            'repeat': max(0, repeat),
+        }
+        # 워커 스레드 시작
+        mission_thread = threading.Thread(target=mission_worker, args=(mission_config,), daemon=True)
+        mission_thread.start()
+    except Exception as e:
+        socketio.emit('serial_log', {'data': f'[MISSION] Error: {e}'})
+
+def mission_worker(cfg):
+    global mission_running
+    mission_running = True
+    try:
+        step = cfg['pitch_step']; seg = cfg['segment_time']; delay = cfg['start_delay']; rep = cfg['repeat']
+        socketio.emit('serial_log', {'data': f"[MISSION] Starting sawtooth_pitch: step={step}, segment_time={seg}, repeat={rep}, start_delay={delay}"})
+        if delay > 0:
+            socketio.emit('serial_log', {'data': f"[MISSION] Waiting {delay:.1f}s before dive"})
+            time.sleep(delay)
+        for i in range(1, rep + 1):
+            cmd1 = f"{+step},0"
+            socketio.emit('serial_log', {'data': f"[MISSION] Cycle {i}/{rep}: command {cmd1}"})
+            send_serial_command(cmd1)
+            time.sleep(seg)
+            cmd2 = f"{-step},0"
+            socketio.emit('serial_log', {'data': f"[MISSION] Cycle {i}/{rep}: command {cmd2}"})
+            send_serial_command(cmd2)
+            time.sleep(seg)
+        socketio.emit('serial_log', {'data': "[MISSION] Completed sawtooth_pitch mission"})
+    except Exception as e:
+        socketio.emit('serial_log', {'data': f"[MISSION] Runtime error: {e}"})
+    finally:
+        mission_running = False
+
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+    socketio.run(app, host='0.0.0.0', port=1234, allow_unsafe_werkzeug=True)

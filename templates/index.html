@@ -96,6 +96,9 @@
         <button class="test-btn" onclick="toggleAxes()">Toggle Axes</button>
       </div>
       <div class="test-buttons">
+        <button class="test-btn" onclick="startPreMission()" style="background:#8e44ad;">Start Pre-Mission Route</button>
+      </div>
+      <div class="test-buttons">
         <select id="gps-path" onchange="changeGPSPath(this.value)">
           <option value="none">No GPS Demo</option>
           <option value="circle">Circular Path</option>
@@ -559,6 +562,17 @@
       window.changeGPSPath = changeGPSPath;
       window.reconnectDevices = ()=>{ socket.emit('request_reconnect'); addLogMessage('Reconnection requested'); };
       window.scanPorts = ()=>{ socket.emit('request_port_scan'); addLogMessage('Port scan requested'); };
+      window.startPreMission = ()=>{
+        const mission = {
+          pattern: "sawtooth_pitch",
+          pitch_step: 200,
+          segment_time: 2.0,
+          start_delay: 20.0,
+          repeat: 5
+        };
+        socket.emit('start_mission', mission);
+        addLogMessage('Pre-mission sawtooth_pitch started');
+      };
 
       commandInput.addEventListener('keydown', e=>{ if(e.key==='Enter') sendCommand(); });
 
