@@ -9,6 +9,7 @@ import json
 import glob
 import os
 import subprocess
+import re
 
 app = Flask(__name__)
 CORS(app)
@@ -29,6 +30,11 @@ mission_config = None
 mission_thread = None
 current_mission = None
 stop_flag = False
+
+# --- 블루투스 SPP 설정 ---
+RFCOMM_DEVICE = os.getenv('BT_RFCOMM_DEV', '/dev/rfcomm0')
+RFCOMM_BAUD = int(os.getenv('BT_BAUD', '115200'))
+bluetooth_thread = None
 
 # --- 아두이노 연결 설정 ---
 BAUD_RATE = 115200
@@ -365,6 +371,71 @@ def start_camera_capture_thread():
     camera_thread = threading.Thread(target=camera_capture_worker, daemon=True)
     camera_thread.start()
 
+# --- 블루투스 SPP 브리지 ---
+def bluetooth_bridge_worker():
+    """
+    /dev/rfcomm0에 연결된 안드로이드 SPP로부터 "M1,M2" 텍스트 라인을 수신하여
+    기존 직렬 송신 헬퍼를 통해 아두이노로 중계한다.
+    """
+    pattern = re.compile(r'^\s*[+-]?\d+\s*,\s*[+-]?\d+\s*$')
+    bt_ser = None
+    last_log_time = 0.0
+    while True:
+        try:
+            if bt_ser is None:
+                if os.path.exists(RFCOMM_DEVICE):
+                    try:
+                        bt_ser = serial.Serial(RFCOMM_DEVICE, RFCOMM_BAUD, timeout=0.2)
+                        socketio.emit('serial_log', {'data': f'[BT] Connected to {RFCOMM_DEVICE} ({RFCOMM_BAUD}bps)'})
+                    except Exception as e:
+                        bt_ser = None
+                        if time.time() - last_log_time > 5:
+                            socketio.emit('serial_log', {'data': f'[BT] Open error on {RFCOMM_DEVICE}: {e}'})
+                            last_log_time = time.time()
+                        time.sleep(1.0)
+                        continue
+                else:
+                    # rfcomm 장치가 없으면 주기적으로 안내
+                    if time.time() - last_log_time > 10:
+                        socketio.emit('serial_log', {'data': f'[BT] Waiting for {RFCOMM_DEVICE}. Pair phone and run SPP (sdptool add SP; rfcomm listen/watch).'})
+                        last_log_time = time.time()
+                    time.sleep(1.0)
+                    continue
+            # 데이터 수신
+            try:
+                line = bt_ser.readline().decode('utf-8', 'ignore').strip()
+            except Exception as e:
+                socketio.emit('serial_log', {'data': f'[BT] Read error: {e}'})
+                try:
+                    bt_ser.close()
+                except Exception:
+                    pass
+                bt_ser = None
+                time.sleep(0.5)
+                continue
+            if not line:
+                continue
+            # 유효성 검사
+            if pattern.match(line):
+                # 그대로 아두이노로 중계
+                send_serial_command(line)
+            else:
+                socketio.emit('serial_log', {'data': f'[BT] Invalid format: "{line}" (expected "M1,M2")'})
+        except Exception as e:
+            # 예외는 로깅 후 재시도
+            try:
+                socketio.emit('serial_log', {'data': f'[BT] Bridge error: {e}'})
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+def start_bluetooth_bridge_thread():
+    global bluetooth_thread
+    if bluetooth_thread and bluetooth_thread.is_alive():
+        return
+    bluetooth_thread = threading.Thread(target=bluetooth_bridge_worker, daemon=True)
+    bluetooth_thread.start()
+
 # 카메라 초기화 실행
 initialize_camera()
 
@@ -510,6 +581,9 @@ def handle_connect():
     if 'thread' not in globals() or not thread.is_alive():
         thread = threading.Thread(target=arduino_reader_thread, daemon=True)
         thread.start()
+    # 블루투스 브리지도 필요 시 시작
+    if 'bluetooth_thread' in globals():
+        start_bluetooth_bridge_thread()
 
 @socketio.on('request_reconnect')
 def handle_reconnect_request():
