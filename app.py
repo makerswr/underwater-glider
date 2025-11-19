@@ -1,4 +1,4 @@
-from flask import Flask, render_template, Response
+from flask import Flask, render_template, Response, send_from_directory, jsonify, request
 from flask_socketio import SocketIO
 from flask_cors import CORS
 import cv2
@@ -37,6 +37,13 @@ SERIAL_PORT = None
 connection_retry_count = 0
 MAX_RETRY_COUNT = 5
 RETRY_DELAY = 2  # 초
+
+# --- 비디오 저장 경로 ---
+VIDEO_DIR = os.path.join(os.path.dirname(__file__), 'videos')
+try:
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+except Exception:
+    pass
 
 def detect_serial_ports():
     ports = []
@@ -180,6 +187,14 @@ def send_cmd(m1: int, m2: int) -> bool:
 camera = None
 camera_status = False
 camera_device = None
+latest_frame = None
+# 녹화 상태
+record_lock = threading.Lock()
+recording = False
+record_writer = None
+record_filename = None
+record_frames = 0
+record_start_time = 0.0
 
 def find_working_camera():
     """사용 가능한 카메라 장치를 찾습니다."""
@@ -294,7 +309,7 @@ def initialize_camera():
 
 # --- 저지연 캡처/프리인코딩 스레드 ---
 def camera_capture_worker():
-    global latest_jpeg
+    global latest_jpeg, latest_frame, recording, record_writer, record_frames
     last_encode = 0.0
     encode_interval = 1.0 / max(1, TARGET_ENCODE_FPS)
     while True:
@@ -304,8 +319,19 @@ def camera_capture_worker():
                 if not success or frame is None:
                     time.sleep(0.005)
                     continue
+                # 최신 프레임 보관 (녹화/기타 용도)
+                with latest_lock:
+                    latest_frame = frame
                 now = time.time()
                 if now - last_encode < encode_interval:
+                    # 인코딩 타이밍이 아니어도 녹화는 수행
+                    with record_lock:
+                        if recording and record_writer is not None:
+                            try:
+                                record_writer.write(frame)
+                                record_frames += 1
+                            except Exception:
+                                pass
                     continue
                 ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)])
                 if ok:
@@ -313,6 +339,14 @@ def camera_capture_worker():
                     with latest_lock:
                         latest_jpeg = data
                     last_encode = now
+                # 녹화 중이면 프레임을 파일에 기록
+                with record_lock:
+                    if recording and record_writer is not None:
+                        try:
+                            record_writer.write(frame)
+                            record_frames += 1
+                        except Exception:
+                            pass
             else:
                 time.sleep(0.1)
         except Exception:
@@ -417,6 +451,33 @@ def video_feed():
         'X-Accel-Buffering': 'no'
     }
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame', headers=headers)
+
+@app.get('/videos')
+def list_videos():
+    try:
+        files = []
+        for name in os.listdir(VIDEO_DIR):
+            if name.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                path = os.path.join(VIDEO_DIR, name)
+                try:
+                    stat = os.stat(path)
+                    files.append({
+                        'name': name,
+                        'size_bytes': stat.st_size,
+                        'mtime': stat.st_mtime
+                    })
+                except Exception:
+                    continue
+        # 최신순 정렬
+        files.sort(key=lambda x: x['mtime'], reverse=True)
+        return jsonify({'videos': files})
+    except Exception as e:
+        return jsonify({'error': str(e), 'videos': []}), 500
+
+@app.get('/videos/<path:filename>')
+def serve_video(filename):
+    # 단순한 파일 서빙 (보안: 상위 경로 이동 방지)
+    return send_from_directory(VIDEO_DIR, filename, as_attachment=False)
 
 @socketio.on('connect')
 def handle_connect():
@@ -643,6 +704,79 @@ def mission_worker(mission_cfg: dict):
         socketio.emit('serial_log', {'data': f"[MISSION] Runtime error: {e}"})
     finally:
         mission_running = False
+
+@socketio.on('start_recording')
+def handle_start_recording():
+    global recording, record_writer, record_filename, record_frames, record_start_time
+    if not camera_status or camera is None or not camera.isOpened():
+        socketio.emit('serial_log', {'data': '[RECORD] ERROR: Camera not available'})
+        socketio.emit('recording_status', {'recording': False, 'message': 'Camera not available'})
+        return
+    with record_lock:
+        if recording:
+            socketio.emit('serial_log', {'data': f'[RECORD] Already recording: {record_filename}'})
+            socketio.emit('recording_status', {'recording': True, 'filename': os.path.basename(record_filename)})
+            return
+        # 프레임 크기/초당프레임 설정
+        width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
+        height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
+        fps = int(TARGET_ENCODE_FPS) or 20
+        # 파일명
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        record_filename = os.path.join(VIDEO_DIR, f'glider_{ts}.mp4')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        try:
+            record_writer = cv2.VideoWriter(record_filename, fourcc, float(fps), (width, height))
+        except Exception as e:
+            record_writer = None
+            socketio.emit('serial_log', {'data': f'[RECORD] ERROR opening writer: {e}'})
+            socketio.emit('recording_status', {'recording': False, 'message': f'Writer error: {e}'})
+            return
+        if record_writer is None or not record_writer.isOpened():
+            record_writer = None
+            socketio.emit('serial_log', {'data': '[RECORD] ERROR: Cannot open VideoWriter'})
+            socketio.emit('recording_status', {'recording': False, 'message': 'Cannot open writer'})
+            return
+        recording = True
+        record_frames = 0
+        record_start_time = time.time()
+        socketio.emit('serial_log', {'data': f'[RECORD] Started: {os.path.basename(record_filename)} ({width}x{height}@{fps}fps)'})
+        socketio.emit('recording_status', {
+            'recording': True,
+            'filename': os.path.basename(record_filename),
+            'frames': record_frames
+        })
+
+@socketio.on('stop_recording')
+def handle_stop_recording():
+    global recording, record_writer, record_filename, record_frames, record_start_time
+    with record_lock:
+        if not recording:
+            socketio.emit('serial_log', {'data': '[RECORD] Not recording'})
+            socketio.emit('recording_status', {'recording': False})
+            return
+        recording = False
+        try:
+            if record_writer is not None:
+                record_writer.release()
+        except Exception:
+            pass
+        duration = max(0.0, time.time() - float(record_start_time or 0.0))
+        fname = os.path.basename(record_filename) if record_filename else '(unknown)'
+        # 프레임 없으면 파일 삭제
+        if record_frames <= 0 and record_filename and os.path.exists(record_filename):
+            try:
+                os.remove(record_filename)
+                socketio.emit('serial_log', {'data': f'[RECORD] No frames captured. File removed: {fname}'})
+            except Exception:
+                pass
+        else:
+            socketio.emit('serial_log', {'data': f'[RECORD] Stopped: {fname} ({record_frames} frames, {duration:.1f}s)'})
+        record_writer = None
+        record_filename = None
+        record_frames = 0
+        record_start_time = 0.0
+        socketio.emit('recording_status', {'recording': False})
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=1234, allow_unsafe_werkzeug=True)

@@ -52,6 +52,22 @@
           <div style="font-size:.9em;opacity:.8;">Glider Control System Active</div>
         </div>
       </div>
+      <div class="test-buttons" style="margin-top:10px;">
+        <button class="test-btn" onclick="startRecording()" style="background:#e74c3c;">Start Recording</button>
+        <button class="test-btn" onclick="stopRecording()" style="background:#95a5a6;">Stop Recording</button>
+        <button class="test-btn" onclick="refreshVideoList()" style="background:#27ae60;">Refresh Videos</button>
+      </div>
+      <div id="recording-info" style="font-size:.9em;color:#666;margin:4px 0 8px 0;">Recording: OFF</div>
+      <div id="video-gallery" style="display:grid;grid-template-columns:1fr 1fr;gap:10px;max-height:22vh;overflow:auto;align-items:start;">
+        <div>
+          <h3 style="margin:6px 0 8px 0;font-size:1em;color:#2c3e50;border-bottom:1px solid #e1e8ed;padding-bottom:4px;">Saved Videos</h3>
+          <div id="saved-videos" style="display:flex;flex-direction:column;gap:6px;"></div>
+        </div>
+        <div>
+          <h3 style="margin:6px 0 8px 0;font-size:1em;color:#2c3e50;border-bottom:1px solid #e1e8ed;padding-bottom:4px;">Player</h3>
+          <video id="video-player" controls style="width:100%;border-radius:6px;background:#000;max-height:18vh;"></video>
+        </div>
+      </div>
     </div>
 
     <!-- 3D 글라이더 패널 -->
@@ -602,6 +618,18 @@
           }
         });
       });
+      socket.on('recording_status', status=>{
+        function setRecordingInfo(text, active){
+          const el = document.getElementById('recording-info');
+          el.textContent = `Recording: ${active ? ('ON' + (text ? ` - ${text}` : '')) : 'OFF'}`;
+          el.style.color = active ? '#e74c3c' : '#666';
+        }
+        if(status && status.recording){
+          setRecordingInfo(status.filename || '', true);
+        } else {
+          setRecordingInfo('', false);
+        }
+      });
 
       window.sendCommand = ()=>{ const c = commandInput.value.trim(); if(c){ socket.emit('control_event',{command:c}); addLogMessage(`Command sent: ${c}`); commandInput.value=''; } };
       window.simulateMovement = simulateMovement;
@@ -614,6 +642,57 @@
       window.changeGPSPath = changeGPSPath;
       window.reconnectDevices = ()=>{ socket.emit('request_reconnect'); addLogMessage('Reconnection requested'); };
       window.scanPorts = ()=>{ socket.emit('request_port_scan'); addLogMessage('Port scan requested'); };
+      // ===== Recording / Video List =====
+      window.startRecording = ()=>{ socket.emit('start_recording'); addLogMessage('Recording start requested'); };
+      window.stopRecording = ()=>{ socket.emit('stop_recording'); addLogMessage('Recording stop requested'); };
+      function renderVideoList(videos){
+        const container = document.getElementById('saved-videos');
+        container.innerHTML = '';
+        if(!videos || !videos.length){
+          const empty = document.createElement('div');
+          empty.style.fontSize = '.9em'; empty.style.color = '#888';
+          empty.textContent = 'No videos';
+          container.appendChild(empty);
+          return;
+        }
+        videos.forEach(v=>{
+          const item = document.createElement('div');
+          item.style.display='flex';
+          item.style.justifyContent='space-between';
+          item.style.alignItems='center';
+          item.style.border='1px solid #e1e8ed';
+          item.style.borderRadius='6px';
+          item.style.padding='6px 8px';
+          item.style.background='#fafbfc';
+          const left = document.createElement('div');
+          left.textContent = v.name;
+          left.style.cursor = 'pointer';
+          left.onclick = ()=> playVideo(v.name);
+          const right = document.createElement('div');
+          right.style.fontSize = '.8em'; right.style.color = '#666';
+          const sizeMB = (Number(v.size_bytes||0)/1024/1024).toFixed(1);
+          right.textContent = `${sizeMB} MB`;
+          item.appendChild(left); item.appendChild(right);
+          container.appendChild(item);
+        });
+      }
+      async function refreshVideoList(){
+        try{
+          const res = await fetch('/videos', { cache: 'no-store' });
+          const data = await res.json();
+          renderVideoList(data.videos || []);
+          addLogMessage('Video list refreshed');
+        }catch(e){
+          addLogMessage('Failed to load videos');
+        }
+      }
+      window.refreshVideoList = refreshVideoList;
+      window.playVideo = (name)=>{
+        const player = document.getElementById('video-player');
+        player.src = `/videos/${encodeURIComponent(name)}?t=${Date.now()}`;
+        player.play().catch(()=>{});
+        addLogMessage(`Playing video: ${name}`);
+      };
       window.startPreMission = ()=>{
         const mission = {
           pattern: "sawtooth_pitch",
@@ -717,6 +796,7 @@
       // 기본 커스텀 세그먼트 2줄(200,0 / -200,0)
       addCustomSegmentRow(200, 0, 2.0);
       addCustomSegmentRow(-200, 0, 2.0);
+      refreshVideoList();
 
       commandInput.addEventListener('keydown', e=>{ if(e.key==='Enter') sendCommand(); });
 
