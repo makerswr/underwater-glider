@@ -276,7 +276,7 @@ def initialize_camera():
             camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             camera.set(cv2.CAP_PROP_FPS, 30)
-            camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # 버퍼 크기 최소화
+            camera.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # 너무 작은 버퍼로 인한 교착 방지
             
             # 실제 프레임 읽기 테스트
             ret, frame = camera.read()
@@ -332,6 +332,8 @@ def camera_capture_worker():
                                 record_frames += 1
                             except Exception:
                                 pass
+                    # 바쁜 루프 방지
+                    time.sleep(0.001)
                     continue
                 ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)])
                 if ok:
@@ -349,7 +351,11 @@ def camera_capture_worker():
                             pass
             else:
                 time.sleep(0.1)
-        except Exception:
+        except Exception as e:
+            try:
+                socketio.emit('serial_log', {'data': f"[VIDEO] capture error: {e}"})
+            except Exception:
+                pass
             time.sleep(0.02)
 
 def start_camera_capture_thread():
@@ -421,8 +427,12 @@ def generate_frames():
         with latest_lock:
             payload = latest_jpeg
         if payload:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + payload + b'\r\n')
+            header = (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n'
+                b'Content-Length: ' + str(len(payload)).encode('ascii') + b'\r\n\r\n'
+            )
+            yield header + payload + b'\r\n'
             time.sleep(max(0.0, 1.0 / max(1, TARGET_ENCODE_FPS)))
             continue
         # 초기 대기 또는 카메라 미가용 시 플레이스홀더 출력
@@ -434,8 +444,12 @@ def generate_frames():
         ret, buffer = cv2.imencode('.jpg', frame)
         if ret:
             frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            header = (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n'
+                b'Content-Length: ' + str(len(frame_bytes)).encode('ascii') + b'\r\n\r\n'
+            )
+            yield header + frame_bytes + b'\r\n'
         time.sleep(0.1)
 
 @app.route('/')
