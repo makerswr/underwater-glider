@@ -23,6 +23,21 @@ latest_lock = threading.Lock()
 camera_thread = None
 TARGET_ENCODE_FPS = 20  # 인코딩 목표 FPS
 JPEG_QUALITY = int(os.getenv('JPEG_QUALITY', '70'))
+ADAPTIVE_JPEG = os.getenv('ADAPTIVE_JPEG', '1').lower() in ('1', 'true', 'yes', 'on')
+TARGET_KB_PER_FRAME = float(os.getenv('TARGET_KB_PER_FRAME', '80'))
+MIN_JPEG_QUALITY = int(os.getenv('MIN_JPEG_QUALITY', '40'))
+MAX_JPEG_QUALITY = int(os.getenv('MAX_JPEG_QUALITY', '85'))
+current_jpeg_quality = max(MIN_JPEG_QUALITY, min(MAX_JPEG_QUALITY, JPEG_QUALITY))
+last_adapt_time = 0.0
+# 스트림 해상도(카메라 해상도와 분리)
+STREAM_WIDTH = int(os.getenv('STREAM_WIDTH', '640'))
+STREAM_HEIGHT = int(os.getenv('STREAM_HEIGHT', '480'))
+
+# 녹화 품질/코덱 설정
+RECORD_PREFERRED_CODEC = (os.getenv('RECORD_CODEC', 'avc1') or 'avc1').upper()
+RECORD_FPS = float(os.getenv('RECORD_FPS', '30'))
+CAM_WIDTH = int(os.getenv('CAM_WIDTH', '640'))
+CAM_HEIGHT = int(os.getenv('CAM_HEIGHT', '480'))
 
 # --- 미션 상태 ---
 mission_running = False
@@ -279,8 +294,8 @@ def initialize_camera():
             except Exception:
                 pass
             # 카메라 설정
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
             camera.set(cv2.CAP_PROP_FPS, 30)
             camera.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # 너무 작은 버퍼로 인한 교착 방지
             
@@ -315,7 +330,7 @@ def initialize_camera():
 
 # --- 저지연 캡처/프리인코딩 스레드 ---
 def camera_capture_worker():
-    global latest_jpeg, latest_frame, recording, record_writer, record_frames
+    global latest_jpeg, latest_frame, recording, record_writer, record_frames, current_jpeg_quality, last_adapt_time
     last_encode = 0.0
     encode_interval = 1.0 / max(1, TARGET_ENCODE_FPS)
     while True:
@@ -341,12 +356,36 @@ def camera_capture_worker():
                     # 바쁜 루프 방지
                     time.sleep(0.001)
                     continue
-                ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(JPEG_QUALITY)])
+                # 스트림 해상도로 다운스케일 후 전송(카메라 해상도와 분리)
+                stream_frame = frame
+                try:
+                    if STREAM_WIDTH > 0 and STREAM_HEIGHT > 0:
+                        h, w = frame.shape[:2]
+                        if w != STREAM_WIDTH or h != STREAM_HEIGHT:
+                            stream_frame = cv2.resize(frame, (STREAM_WIDTH, STREAM_HEIGHT), interpolation=cv2.INTER_AREA)
+                except Exception:
+                    stream_frame = frame
+                q = int(current_jpeg_quality)
+                ok, buf = cv2.imencode('.jpg', stream_frame, [int(cv2.IMWRITE_JPEG_QUALITY), q])
                 if ok:
                     data = buf.tobytes()
                     with latest_lock:
                         latest_jpeg = data
                     last_encode = now
+                    if ADAPTIVE_JPEG:
+                        try:
+                            size_kb = len(data) / 1024.0
+                            if (now - float(last_adapt_time or 0.0)) > 0.3:
+                                new_q = q
+                                if size_kb > TARGET_KB_PER_FRAME * 1.2:
+                                    new_q = max(MIN_JPEG_QUALITY, q - 5)
+                                elif size_kb < TARGET_KB_PER_FRAME * 0.6:
+                                    new_q = min(MAX_JPEG_QUALITY, q + 2)
+                                if new_q != q:
+                                    current_jpeg_quality = new_q
+                                last_adapt_time = now
+                        except Exception:
+                            pass
                 # 녹화 중이면 프레임을 파일에 기록
                 with record_lock:
                     if recording and record_writer is not None:
@@ -494,17 +533,22 @@ def arduino_reader_thread():
 
 def generate_frames():
     import numpy as np
+    prev_payload = None
     while True:
         with latest_lock:
             payload = latest_jpeg
         if payload:
+            # 새 프레임이 올 때만 전송(중복 전송 방지)
+            if payload is prev_payload:
+                time.sleep(0.002)
+                continue
             header = (
                 b'--frame\r\n'
                 b'Content-Type: image/jpeg\r\n'
                 b'Content-Length: ' + str(len(payload)).encode('ascii') + b'\r\n\r\n'
             )
             yield header + payload + b'\r\n'
-            time.sleep(max(0.0, 1.0 / max(1, TARGET_ENCODE_FPS)))
+            prev_payload = payload
             continue
         # 초기 대기 또는 카메라 미가용 시 플레이스홀더 출력
         frame = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -530,7 +574,7 @@ def index():
 @app.route('/video_feed')
 def video_feed():
     headers = {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Cache-Control': 'no-cache, no-store, must-revalidate, no-transform',
         'Pragma': 'no-cache',
         'Expires': '0',
         'X-Accel-Buffering': 'no'
@@ -800,35 +844,59 @@ def handle_start_recording():
         socketio.emit('serial_log', {'data': '[RECORD] ERROR: Camera not available'})
         socketio.emit('recording_status', {'recording': False, 'message': 'Camera not available'})
         return
+    def _try_open_writer(base_path: str, width: int, height: int, fps: float):
+        """
+        선호 코덱(RECORD_CODEC) 우선, 실패 시 폴백 순서대로 시도.
+        반환: (writer, filename) 혹은 (None, None)
+        """
+        prefer = RECORD_PREFERRED_CODEC.upper() if isinstance(RECORD_PREFERRED_CODEC, str) else 'AVC1'
+        # 코덱 후보 테이블: (fourcc, ext)
+        codec_map = {
+            'AVC1': ('avc1', '.mp4'),
+            'H264': ('H264', '.mp4'),
+            'X264': ('X264', '.mp4'),
+            'MP4V': ('mp4v', '.mp4'),
+            'MJPG': ('MJPG', '.avi'),
+            'XVID': ('XVID', '.avi'),
+        }
+        order = [prefer, 'H264', 'X264', 'MP4V', 'MJPG', 'XVID']
+        for key in order:
+            key_up = key.upper()
+            if key_up not in codec_map:
+                continue
+            fourcc_key, ext = codec_map[key_up]
+            fourcc = cv2.VideoWriter_fourcc(*fourcc_key)
+            filename = base_path + ext
+            try:
+                w = cv2.VideoWriter(filename, fourcc, float(fps), (int(width), int(height)))
+                if w is not None and w.isOpened():
+                    socketio.emit('serial_log', {'data': f'[RECORD] Using codec {key_up} -> {os.path.basename(filename)}'})
+                    return w, filename
+            except Exception as e:
+                socketio.emit('serial_log', {'data': f'[RECORD] Codec {key_up} failed: {e}'})
+        return None, None
     with record_lock:
         if recording:
             socketio.emit('serial_log', {'data': f'[RECORD] Already recording: {record_filename}'})
             socketio.emit('recording_status', {'recording': True, 'filename': os.path.basename(record_filename)})
             return
         # 프레임 크기/초당프레임 설정
-        width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-        height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-        fps = int(TARGET_ENCODE_FPS) or 20
+        width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH) or CAM_WIDTH or 640)
+        height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT) or CAM_HEIGHT or 480)
+        fps_cap = float(camera.get(cv2.CAP_PROP_FPS) or 0.0)
+        fps = float(RECORD_FPS if RECORD_FPS > 0 else (fps_cap if fps_cap > 0 else 30.0))
         # 파일명
         ts = time.strftime('%Y%m%d_%H%M%S')
-        record_filename = os.path.join(VIDEO_DIR, f'glider_{ts}.mp4')
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        try:
-            record_writer = cv2.VideoWriter(record_filename, fourcc, float(fps), (width, height))
-        except Exception as e:
-            record_writer = None
-            socketio.emit('serial_log', {'data': f'[RECORD] ERROR opening writer: {e}'})
-            socketio.emit('recording_status', {'recording': False, 'message': f'Writer error: {e}'})
-            return
+        base = os.path.join(VIDEO_DIR, f'glider_{ts}')
+        record_writer, record_filename = _try_open_writer(base, width, height, fps)
         if record_writer is None or not record_writer.isOpened():
-            record_writer = None
-            socketio.emit('serial_log', {'data': '[RECORD] ERROR: Cannot open VideoWriter'})
-            socketio.emit('recording_status', {'recording': False, 'message': 'Cannot open writer'})
+            socketio.emit('serial_log', {'data': '[RECORD] ERROR: Cannot open any VideoWriter (tried avc1/h264/x264/mp4v/mjpg/xvid)'})
+            socketio.emit('recording_status', {'recording': False, 'message': 'No suitable codec'})
             return
         recording = True
         record_frames = 0
         record_start_time = time.time()
-        socketio.emit('serial_log', {'data': f'[RECORD] Started: {os.path.basename(record_filename)} ({width}x{height}@{fps}fps)'})
+        socketio.emit('serial_log', {'data': f'[RECORD] Started: {os.path.basename(record_filename)} ({width}x{height}@{fps:.1f}fps)'})
         socketio.emit('recording_status', {
             'recording': True,
             'filename': os.path.basename(record_filename),
