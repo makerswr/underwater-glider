@@ -935,4 +935,9 @@ def handle_stop_recording():
         socketio.emit('recording_status', {'recording': False})
 
 if __name__ == '__main__':
+    # 부팅 시 블루투스 브리지 스레드도 항상 시작 (웹 클라이언트 연결 유무와 무관)
+    try:
+        start_bluetooth_bridge_thread()
+    except Exception:
+        pass
     socketio.run(app, host='0.0.0.0', port=1234, allow_unsafe_werkzeug=True)
